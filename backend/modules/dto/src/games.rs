@@ -168,3 +168,40 @@ pub struct ImportGameResponse {
     
     pub error: Option<String>,
 }
+
+/// Request body for completing a game and updating player ratings
+#[derive(Debug, Serialize, Deserialize, ToSchema, Validate)]
+pub struct CompleteGameRequest {
+    #[schema(example = "white_wins")]
+    pub result: String,
+    
+    #[validate(range(min = 16, max = 64, message = "K-factor must be between 16 and 64"))]
+    #[schema(default = 32, example = 32)]
+    pub k_factor: Option<u32>,
+}
+
+/// Response for game completion with updated ratings
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CompleteGameResponse {
+    pub success: bool,
+    
+    #[schema(value_type = String, format = "uuid")]
+    pub game_id: Uuid,
+    
+    #[schema(example = "white_wins")]
+    pub result: String,
+    
+    #[schema(example = 1532)]
+    pub white_new_rating: i32,
+    
+    #[schema(example = 1468)]
+    pub black_new_rating: i32,
+    
+    #[schema(example = 16)]
+    pub rating_change_white: i32,
+    
+    #[schema(example = -16)]
+    pub rating_change_black: i32,
+    
+    pub error: Option<String>,
+}

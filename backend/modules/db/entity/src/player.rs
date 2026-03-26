@@ -20,6 +20,7 @@ pub struct Model {
     pub real_name: String,
     pub location: Option<String>,
     pub fide_rating: Option<i32>,
+    pub elo_rating: i32,
     pub social_links: Option<Vec<String>>,
     pub is_enabled: bool
 }

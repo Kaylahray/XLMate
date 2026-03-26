@@ -7,3 +7,8 @@ edition = "2021"
 shakmaty = "0.27"
 regex = "1.10"
 thiserror = "1.0"
+sea-orm = { version = "1.1.0", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+db_entity = { path = "../db/entity" }
+error = { path = "../error" }
+matchmaking = { path = "../matchmaking" }

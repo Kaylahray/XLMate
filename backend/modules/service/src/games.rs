@@ -1,7 +1,7 @@
 use db_entity::{game, prelude::Game};
 use sea_orm::{
     ColumnTrait, DbErr, EntityTrait, Order, QueryFilter,
-    QueryOrder, QuerySelect,
+    QueryOrder, QuerySelect, ActiveModelTrait, Set,
 };
 use sea_orm::{Condition, DatabaseConnection};
 use uuid::Uuid;
@@ -10,6 +10,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use dto::games::{GameStatus, CreateGameRequest, MakeMoveRequest, GameDisplayDTO};
 use error::error::ApiError;
 use chess::pgn::ValidatedGame;
+use chess::{RatingService, RatingConfig};
 
 pub struct GameService;
 
@@ -60,6 +61,97 @@ impl GameService {
         _request: &ValidatedGame,
     ) -> Result<Uuid, ApiError> {
         Err(ApiError::NotImplemented("import_game not yet implemented".to_string()))
+    }
+
+    /// Complete a game with the given result and update player ratings
+    /// 
+    /// # Arguments
+    /// * `db` - Database connection
+    /// * `game_id` - UUID of the game to complete
+    /// * `result` - The final result of the game
+    /// * `rating_config` - Optional rating configuration (uses default if None)
+    /// 
+    /// # Returns
+    /// * `Ok((white_new_rating, black_new_rating))` - New ratings for both players
+    /// * `Err(ApiError)` - If game not found, already completed, or database error
+    /// 
+    /// This method:
+    /// 1. Updates the game result in a transaction
+    /// 2. Calculates and updates player ratings atomically
+    /// 3. Ensures no race conditions during rapid consecutive games
+    pub async fn complete_game(
+        db: &DatabaseConnection,
+        game_id: Uuid,
+        result: db_entity::game::ResultSide,
+        rating_config: Option<RatingConfig>,
+    ) -> Result<(i32, i32), ApiError> {
+        // Use default rating config if none provided
+        let config = rating_config.unwrap_or_default();
+
+        // Start transaction for atomic game completion and rating update
+        let txn = db.begin().await
+            .map_err(|e| ApiError::DatabaseError(format!("Failed to start transaction: {}", e)))?;
+
+        // 1. Update game result
+        let game_model = game::Entity::find_by_id(game_id)
+            .one(&txn)
+            .await
+            .map_err(|e| ApiError::DatabaseError(format!("Failed to fetch game: {}", e)))?
+            .ok_or_else(|| ApiError::NotFound("Game not found".to_string()))?;
+
+        // Check if game is already completed
+        if game_model.result.is_some() {
+            let _ = txn.rollback().await;
+            return Err(ApiError::BadRequest("Game is already completed".to_string()));
+        }
+
+        // Update game with result
+        let mut game_active_model: game::ActiveModel = game_model.into();
+        game_active_model.result = Set(Some(result.clone()));
+        game_active_model.updated_at = Set(Utc::now().into());
+
+        game_active_model.update(&txn).await
+            .map_err(|e| ApiError::DatabaseError(format!("Failed to update game result: {}", e)))?;
+
+        // 2. Update player ratings using the rating service
+        let ratings_result = RatingService::update_ratings_in_transaction(&txn, game_id, &config).await;
+
+        match ratings_result {
+            Ok(ratings) => {
+                // Commit transaction if both game update and rating update succeeded
+                txn.commit().await
+                    .map_err(|e| ApiError::DatabaseError(format!("Failed to commit transaction: {}", e)))?;
+                Ok(ratings)
+            }
+            Err(e) => {
+                // Rollback transaction on rating update failure
+                let _ = txn.rollback().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Get a player's rating for a specific game (helper method for rating calculations)
+    pub async fn get_player_rating_for_game(
+        db: &DatabaseConnection,
+        game_id: Uuid,
+        is_white: bool,
+    ) -> Result<i32, ApiError> {
+        // Fetch the game to get player IDs
+        let game_model = game::Entity::find_by_id(game_id)
+            .one(db)
+            .await
+            .map_err(|e| ApiError::DatabaseError(format!("Failed to fetch game: {}", e)))?
+            .ok_or_else(|| ApiError::NotFound("Game not found".to_string()))?;
+
+        let player_id = if is_white {
+            game_model.white_player
+        } else {
+            game_model.black_player
+        };
+
+        // Use the rating service to get the player's current rating
+        chess::RatingService::get_player_rating(db, player_id).await
     }
 
     /// List games with keyset pagination.

@@ -8,6 +8,7 @@ mod m20250604_160341_create_games_and_moves;
 mod m20250605_090000_add_game_search_indexes;
 mod m20260127_create_refresh_tokens_table;
 mod m20260127_180000_add_game_imported_flag;
+mod m20250324_add_elo_rating_to_player;
 
 
 pub struct Migrator;
@@ -24,6 +25,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20250605_090000_add_game_search_indexes::Migration),
             Box::new(m20260127_create_refresh_tokens_table::Migration),
             Box::new(m20260127_180000_add_game_imported_flag::Migration),
+            Box::new(m20250324_add_elo_rating_to_player::Migration),
         ]
     }
 }

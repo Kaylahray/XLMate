@@ -6,6 +6,7 @@ use dto::{
     games::{
         CreateGameRequest, GameDisplayDTO, MakeMoveRequest, JoinGameRequest,
         GameStatus, ListGamesQuery, ImportGameRequest, ImportGameResponse,
+        CompleteGameRequest, CompleteGameResponse,
     },
     responses::{InvalidCredentialsResponse, NotFoundResponse},
 };
@@ -450,4 +451,142 @@ pub async fn import_game(
             })
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// PUT /v1/games/{id}/complete
+// ---------------------------------------------------------------------------
+#[utoipa::path(
+    put,
+    path = "/v1/games/{id}/complete",
+    params(
+        ("id" = String, Path, description = "Game ID in UUID format", format = "uuid")
+    ),
+    request_body = CompleteGameRequest,
+    responses(
+        (status = 200, description = "Game completed and ratings updated", body = CompleteGameResponse),
+        (status = 400, description = "Invalid game result or game already completed", body = InvalidCredentialsResponse),
+        (status = 404, description = "Game not found", body = NotFoundResponse)
+    ),
+    security(("jwt_auth" = [])),
+    tag = "Games"
+)]
+#[put("/{id}/complete")]
+pub async fn complete_game(
+    req: HttpRequest,
+    id: Path<Uuid>,
+    payload: Json<CompleteGameRequest>,
+    db: web::Data<DatabaseConnection>,
+) -> HttpResponse {
+    if let Err(errors) = payload.0.validate() {
+        return ApiError::ValidationError(errors).error_response();
+    }
+
+    let _player_id = match authenticated_player(&req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let game_id = id.into_inner();
+
+    // Parse the result string to the enum
+    let result_enum = match payload.result.as_str() {
+        "white_wins" => db_entity::game::ResultSide::WhiteWins,
+        "black_wins" => db_entity::game::ResultSide::BlackWins,
+        "draw" => db_entity::game::ResultSide::Draw,
+        "abandoned" => db_entity::game::ResultSide::Abandoned,
+        _ => {
+            return HttpResponse::BadRequest().json(json!({
+                "message": "Invalid result. Must be one of: white_wins, black_wins, draw, abandoned"
+            }));
+        }
+    };
+
+    // Create rating config with custom K-factor if provided
+    let rating_config = chess::RatingConfig {
+        k_factor: payload.k_factor.unwrap_or(32),
+        ..Default::default()
+    };
+
+    // Get current ratings before update for calculating changes
+    let white_old_rating = match service::games::GameService::get_player_rating_for_game(
+        db.get_ref(), 
+        game_id, 
+        true // white player
+    ).await {
+        Ok(rating) => rating,
+        Err(e) => {
+            eprintln!("Failed to get white player rating: {e}");
+            return HttpResponse::InternalServerError().json(json!({
+                "message": "Failed to get player ratings"
+            }));
+        }
+    };
+
+    let black_old_rating = match service::games::GameService::get_player_rating_for_game(
+        db.get_ref(), 
+        game_id, 
+        false // black player
+    ).await {
+        Ok(rating) => rating,
+        Err(e) => {
+            eprintln!("Failed to get black player rating: {e}");
+            return HttpResponse::InternalServerError().json(json!({
+                "message": "Failed to get player ratings"
+            }));
+        }
+    };
+
+    // Complete the game and update ratings
+    match GameService::complete_game(db.get_ref(), game_id, result_enum.clone(), Some(rating_config)).await {
+        Ok((white_new_rating, black_new_rating)) => {
+            let white_change = white_new_rating - white_old_rating;
+            let black_change = black_new_rating - black_old_rating;
+
+            HttpResponse::Ok().json(CompleteGameResponse {
+                success: true,
+                game_id,
+                result: payload.result.clone(),
+                white_new_rating,
+                black_new_rating,
+                rating_change_white: white_change,
+                rating_change_black: black_change,
+                error: None,
+            })
+        }
+        Err(ApiError::NotFound(_)) => HttpResponse::NotFound().json(CompleteGameResponse {
+            success: false,
+            game_id,
+            result: payload.result.clone(),
+            white_new_rating: white_old_rating,
+            black_new_rating: black_old_rating,
+            rating_change_white: 0,
+            rating_change_black: 0,
+            error: Some("Game not found".to_string()),
+        }),
+        Err(ApiError::BadRequest(msg)) => HttpResponse::BadRequest().json(CompleteGameResponse {
+            success: false,
+            game_id,
+            result: payload.result.clone(),
+            white_new_rating: white_old_rating,
+            black_new_rating: black_old_rating,
+            rating_change_white: 0,
+            rating_change_black: 0,
+            error: Some(msg),
+        }),
+        Err(e) => {
+            eprintln!("complete_game error: {e}");
+            HttpResponse::InternalServerError().json(CompleteGameResponse {
+                success: false,
+                game_id,
+                result: payload.result.clone(),
+                white_new_rating: white_old_rating,
+                black_new_rating: black_old_rating,
+                rating_change_white: 0,
+                rating_change_black: 0,
+                error: Some("Failed to complete game and update ratings".to_string()),
+            })
+        }
+    }
+}
 }
