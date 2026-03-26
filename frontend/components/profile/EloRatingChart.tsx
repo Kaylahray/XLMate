@@ -96,7 +96,8 @@ interface EloRatingChartProps {
 
 export function EloRatingChart({
   data = MOCK_ELO_DATA,
-  title = 'Elo Rating — Last 30 Games',
+  title = 'Elo Ratin
+Closes #151g — Last 30 Games',
 }: EloRatingChartProps) {
   const elos = data.map((d) => d.elo);
   const minElo = Math.min(...elos);
