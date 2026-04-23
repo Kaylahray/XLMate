@@ -43,24 +43,16 @@ pub struct ChessMove {
 }
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DisputeStatus {
-    Pending,
-    Resolved,
-    Rejected,
-}
-
-#[contracttype]
 #[derive(Clone, Debug)]
-pub struct Dispute {
-    pub id: u64,
-    pub game_id: u64,
-    pub filer: Address,      // Player who filed the dispute
-    pub against: Address,    // Opponent
-    pub reason: Bytes,       // Dispute reason (encoded)
-    pub status: DisputeStatus,
-    pub filed_at: u64,       // Ledger sequence
-    pub resolution: Option<Bytes>, // Arbitrator's resolution
+pub struct PlayerRating {
+    pub address: Address,
+    pub rating: i32,          // Current ELO rating
+    pub games_played: u32,
+    pub wins: u32,
+    pub losses: u32,
+    pub draws: u32,
+    pub highest_rating: i32,
+    pub last_updated: u64,    // Ledger sequence
 }
 
 // ────────────────────────────────────────────────────────────────────────────
