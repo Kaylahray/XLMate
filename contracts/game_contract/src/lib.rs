@@ -864,21 +864,21 @@ impl GameContract {
         let mut rating1 = ratings.get(player1.clone()).ok_or(ContractError::RatingNotFound)?;
         let mut rating2 = ratings.get(player2.clone()).ok_or(ContractError::RatingNotFound)?;
 
-        // Calculate expected scores
-        let expected1 = Self::calculate_expected_score(rating1.rating, rating2.rating);
-        let expected2 = Self::calculate_expected_score(rating2.rating, rating1.rating);
+        // Calculate expected scores (scaled by 10000)
+        let expected1 = Self::calculate_expected_score_scaled(rating1.rating, rating2.rating);
+        let expected2 = Self::calculate_expected_score_scaled(rating2.rating, rating1.rating);
 
-        // Determine actual scores
+        // Determine actual scores (scaled by 10000)
         let (score1, score2) = match result {
-            1 => (1.0, 0.0), // Player1 wins
-            2 => (0.0, 1.0), // Player2 wins
-            3 => (0.5, 0.5), // Draw
-            _ => (0.0, 0.0),
+            1 => (10000, 0),     // Player1 wins
+            2 => (0, 10000),     // Player2 wins
+            3 => (5000, 5000),   // Draw
+            _ => (0, 0),
         };
 
         // Calculate rating changes
-        let change1 = Self::calculate_rating_change(expected1, score1, k_factor);
-        let change2 = Self::calculate_rating_change(expected2, score2, k_factor);
+        let change1 = Self::calculate_rating_change_scaled(expected1, score1, k_factor);
+        let change2 = Self::calculate_rating_change_scaled(expected2, score2, k_factor);
 
         // Update ratings
         rating1.rating += change1;
@@ -942,18 +942,43 @@ impl GameContract {
 
     // ── Internal ELO Calculation Helpers ───────────────────────────────────
 
-    /// Calculate expected score for a player
+    /// Calculate expected score for a player using integer arithmetic
     /// E_a = 1 / (1 + 10^((R_b - R_a) / 400))
-    fn calculate_expected_score(rating_a: i32, rating_b: i32) -> f64 {
-        let rating_diff = rating_b as f64 - rating_a as f64;
-        1.0 / (1.0 + f64::powf(10.0, rating_diff / 400.0))
+    /// Returns value scaled by 10000 for precision (e.g., 0.5 -> 5000)
+    fn calculate_expected_score_scaled(rating_a: i32, rating_b: i32) -> i32 {
+        let rating_diff = rating_b - rating_a;
+        
+        // Use lookup table approach for common rating differences
+        // This avoids floating-point math entirely
+        // Expected score = 1 / (1 + 10^(diff/400))
+        // We'll use a simplified approximation
+        
+        // For diff = 0, expected = 0.5 (5000)
+        // For diff = +400, expected ≈ 0.09 (900)
+        // For diff = -400, expected ≈ 0.91 (9100)
+        
+        // Linear approximation: expected = 0.5 - (diff / 800)
+        // Clamp between 0.09 and 0.91
+        let mut expected = 5000 - (rating_diff * 5000 / 800);
+        
+        // Clamp values
+        if expected < 900 {
+            expected = 900;
+        } else if expected > 9100 {
+            expected = 9100;
+        }
+        
+        expected
     }
 
-    /// Calculate rating change
+    /// Calculate rating change using integer arithmetic
     /// ΔR = K * (S - E)
-    fn calculate_rating_change(expected: f64, actual: f64, k_factor: u32) -> i32 {
-        let change = (k_factor as f64) * (actual - expected);
-        change.round() as i32
+    /// Scores are scaled by 10000
+    fn calculate_rating_change_scaled(expected_scaled: i32, actual_score: i32, k_factor: u32) -> i32 {
+        // actual_score: 10000 for win, 5000 for draw, 0 for loss
+        // expected_scaled: expected score * 10000
+        let diff = actual_score - expected_scaled;
+        ((k_factor as i32) * diff) / 10000
     }
 }
 
