@@ -42,6 +42,19 @@ pub struct ChessMove {
     pub timestamp: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PlayerRating {
+    pub address: Address,
+    pub rating: i32,          // Current ELO rating
+    pub games_played: u32,
+    pub wins: u32,
+    pub losses: u32,
+    pub draws: u32,
+    pub highest_rating: i32,
+    pub last_updated: u64,    // Ledger sequence
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Storage keys
 // ────────────────────────────────────────────────────────────────────────────
