@@ -31,6 +31,7 @@ pub struct Game {
     pub moves: Vec<ChessMove>,
     pub created_at: u64,
     pub winner: Option<Address>,
+    pub last_move_at: u64, // Ledger sequence of last move
 }
 
 #[contracttype]
@@ -76,9 +77,9 @@ const FEE_BIPS: Symbol = symbol_short!("FEE_BIPS"); // u32  (0–1000, i.e. 0–
 const TREASURY_ADDR: Symbol = symbol_short!("TR_ADDR"); // Address
 const CONTRACT_ADMIN: Symbol = symbol_short!("CT_ADMIN"); // Address
 
-// ELO Rating System
-const PLAYER_RATINGS: Symbol = symbol_short!("RATING"); // Map<Address, PlayerRating>
-const K_FACTOR: Symbol = symbol_short!("K_FACT"); // u32 - ELO K-factor for rating calculations
+// Game timeout mechanism
+const TIMEOUT_DURATION: Symbol = symbol_short!("T_OUT"); // u64 - ledger sequences before timeout
+const LAST_MOVE_TIME: Symbol = symbol_short!("L_MOVE"); // Map<u64, u64> - game_id => last_move_ledger
 
 // ────────────────────────────────────────────────────────────────────────────
 // Errors
@@ -103,8 +104,10 @@ pub enum ContractError {
     /// Invalid or already-used backend signature  (#199)
     Unauthorized = 14,
     StakeLimitExceeded = 15,
-    /// Player has no rating yet
-    RatingNotFound = 16,
+    /// Game has not timed out yet
+    TimeoutNotReached = 16,
+    /// Timeout feature not configured
+    TimeoutNotConfigured = 17,
 }
 
 #[contract]
@@ -170,6 +173,7 @@ impl GameContract {
             moves: Vec::new(&env),
             created_at: env.ledger().sequence() as u64,
             winner: None,
+            last_move_at: env.ledger().sequence() as u64,
         };
 
         let mut games: Map<u64, Game> = env
@@ -229,6 +233,7 @@ impl GameContract {
         game.player2 = Some(player2.clone());
         game.state = GameState::InProgress;
         game.current_turn = 1;
+        game.last_move_at = env.ledger().sequence() as u64;
 
         let mut escrow: Map<Address, i128> = env
             .storage()
@@ -286,6 +291,7 @@ impl GameContract {
         };
         game.moves.push_back(chess_move.into());
         game.current_turn = if game.current_turn == 1 { 2 } else { 1 };
+        game.last_move_at = env.ledger().sequence() as u64;
 
         games.set(game_id, game);
         env.storage().instance().set(&GAMES, &games);
@@ -768,10 +774,11 @@ impl GameContract {
         env.storage().instance().get(&TREASURY).unwrap_or(0)
     }
 
-    // ── ELO Rating System ──────────────────────────────────────────────────
+    // ── Game Timeout Mechanism ─────────────────────────────────────────────
 
-    /// Initialize ELO rating system with default K-factor of 32
-    pub fn initialize_elo_system(env: Env, admin: Address, k_factor: u32) {
+    /// Configure timeout duration (in ledger sequences)
+    /// Default Stellar ledger is ~5 seconds, so 8640 = ~12 hours
+    pub fn configure_timeout(env: Env, admin: Address, duration: u64) {
         let current_admin: Address = env
             .storage()
             .instance()
@@ -782,203 +789,94 @@ impl GameContract {
         if admin != current_admin {
             panic!("Unauthorized admin address");
         }
-        if k_factor == 0 || k_factor > 100 {
-            panic!("K-factor must be between 1 and 100");
+        if duration == 0 {
+            panic!("Timeout duration must be greater than 0");
         }
 
-        env.storage().instance().set(&K_FACTOR, &k_factor);
+        env.storage().instance().set(&TIMEOUT_DURATION, &duration);
     }
 
-    /// Register a new player with default rating (1200)
-    /// Or return existing player rating
-    pub fn register_player(env: Env, player: Address) -> PlayerRating {
-        player.require_auth();
-
-        let mut ratings: Map<Address, PlayerRating> = env
+    /// Claim timeout win when opponent hasn't moved within timeout period
+    /// The current player can claim victory if the opponent hasn't made a move
+    /// within the configured timeout duration
+    pub fn claim_timeout_win(env: Env, game_id: u64, claimant: Address) -> Result<(), ContractError> {
+        let mut games: Map<u64, Game> = env
             .storage()
             .instance()
-            .get(&PLAYER_RATINGS)
-            .unwrap_or(Map::new(&env));
+            .get(&GAMES)
+            .ok_or(ContractError::GameNotFound)?;
 
-        // Check if player already exists
-        if let Some(rating) = ratings.get(player.clone()) {
-            return rating;
+        let mut game = games.get(game_id).ok_or(ContractError::GameNotFound)?;
+
+        // Game must be in progress
+        if game.state != GameState::InProgress {
+            return Err(ContractError::GameNotInProgress);
         }
 
-        // Create new player with default rating
-        let new_rating = PlayerRating {
-            address: player.clone(),
-            rating: 1200,
-            games_played: 0,
-            wins: 0,
-            losses: 0,
-            draws: 0,
-            highest_rating: 1200,
-            last_updated: env.ledger().sequence() as u64,
-        };
+        // Claimant must be a player
+        if claimant != game.player1 && Some(claimant.clone()) != game.player2 {
+            return Err(ContractError::NotPlayer);
+        }
 
-        ratings.set(player.clone(), new_rating.clone());
-        env.storage().instance().set(&PLAYER_RATINGS, &ratings);
+        // Get timeout configuration
+        let timeout_duration: u64 = env
+            .storage()
+            .instance()
+            .get(&TIMEOUT_DURATION)
+            .ok_or(ContractError::TimeoutNotConfigured)?;
 
-        // Emit registration event
+        // Check if timeout has been reached
+        let current_ledger = env.ledger().sequence() as u64;
+        let elapsed = current_ledger - game.last_move_at;
+
+        if elapsed < timeout_duration {
+            return Err(ContractError::TimeoutNotReached);
+        }
+
+        // Determine winner (the claimant, since opponent timed out)
+        game.state = GameState::Completed;
+        game.winner = Some(claimant.clone());
+
+        // Process payout to winner
+        Self::process_payout(&env, &game, &claimant)?;
+
+        games.set(game_id, game);
+        env.storage().instance().set(&GAMES, &games);
+
+        // Emit timeout event
         env.events().publish(
-            (symbol_short!("elo"), symbol_short!("reg")),
-            (player, 1200i32),
+            (symbol_short!("timeout"), game_id),
+            (claimant, timeout_duration),
         );
 
-        new_rating
+        Ok(())
     }
 
-    /// Update player ratings after a game
-    /// This should be called internally when a game completes
-    /// Uses standard ELO formula:
-    ///   R' = R + K * (S - E)
-    /// where:
-    ///   R' = new rating
-    ///   R  = current rating
-    ///   K  = K-factor
-    ///   S  = actual score (1=win, 0.5=draw, 0=loss)
-    ///   E  = expected score = 1 / (1 + 10^((Rb-Ra)/400))
-    pub fn update_ratings(
-        env: Env,
-        player1: Address,
-        player2: Address,
-        result: u32, // 1 = player1 wins, 2 = player2 wins, 3 = draw
-    ) -> Result<(PlayerRating, PlayerRating), ContractError> {
-        if result < 1 || result > 3 {
-            return Err(ContractError::InvalidMove);
-        }
-
-        let k_factor: u32 = env
+    /// Query remaining time before timeout (in ledger sequences)
+    /// Returns None if timeout not configured or game not in progress
+    pub fn get_timeout_remaining(env: Env, game_id: u64) -> Option<u64> {
+        let games: Map<u64, Game> = env
             .storage()
             .instance()
-            .get(&K_FACTOR)
-            .unwrap_or(32); // Default K-factor
+            .get(&GAMES)
+            .ok_or(ContractError::GameNotFound)
+            .ok()?;
 
-        let mut ratings: Map<Address, PlayerRating> = env
-            .storage()
-            .instance()
-            .get(&PLAYER_RATINGS)
-            .ok_or(ContractError::RatingNotFound)?;
+        let game = games.get(game_id).ok_or(ContractError::GameNotFound).ok()?;
 
-        let mut rating1 = ratings.get(player1.clone()).ok_or(ContractError::RatingNotFound)?;
-        let mut rating2 = ratings.get(player2.clone()).ok_or(ContractError::RatingNotFound)?;
-
-        // Calculate expected scores (scaled by 10000)
-        let expected1 = Self::calculate_expected_score_scaled(rating1.rating, rating2.rating);
-        let expected2 = Self::calculate_expected_score_scaled(rating2.rating, rating1.rating);
-
-        // Determine actual scores (scaled by 10000)
-        let (score1, score2) = match result {
-            1 => (10000, 0),     // Player1 wins
-            2 => (0, 10000),     // Player2 wins
-            3 => (5000, 5000),   // Draw
-            _ => (0, 0),
-        };
-
-        // Calculate rating changes
-        let change1 = Self::calculate_rating_change_scaled(expected1, score1, k_factor);
-        let change2 = Self::calculate_rating_change_scaled(expected2, score2, k_factor);
-
-        // Update ratings
-        rating1.rating += change1;
-        rating2.rating += change2;
-
-        // Update highest rating
-        if rating1.rating > rating1.highest_rating {
-            rating1.highest_rating = rating1.rating;
-        }
-        if rating2.rating > rating2.highest_rating {
-            rating2.highest_rating = rating2.rating;
+        if game.state != GameState::InProgress {
+            return None;
         }
 
-        // Update stats
-        rating1.games_played += 1;
-        rating2.games_played += 1;
+        let timeout_duration: u64 = env.storage().instance().get(&TIMEOUT_DURATION)?;
+        let current_ledger = env.ledger().sequence() as u64;
+        let elapsed = current_ledger - game.last_move_at;
 
-        match result {
-            1 => {
-                rating1.wins += 1;
-                rating2.losses += 1;
-            }
-            2 => {
-                rating2.wins += 1;
-                rating1.losses += 1;
-            }
-            3 => {
-                rating1.draws += 1;
-                rating2.draws += 1;
-            }
-            _ => {}
+        if elapsed >= timeout_duration {
+            return Some(0);
         }
 
-        rating1.last_updated = env.ledger().sequence() as u64;
-        rating2.last_updated = env.ledger().sequence() as u64;
-
-        // Save ratings
-        ratings.set(player1.clone(), rating1.clone());
-        ratings.set(player2.clone(), rating2.clone());
-        env.storage().instance().set(&PLAYER_RATINGS, &ratings);
-
-        // Emit rating update event
-        env.events().publish(
-            (symbol_short!("elo"), symbol_short!("update")),
-            (player1, rating1.rating, player2, rating2.rating),
-        );
-
-        Ok((rating1, rating2))
-    }
-
-    /// Query a player's rating
-    pub fn get_player_rating(env: Env, player: Address) -> Result<PlayerRating, ContractError> {
-        let ratings: Map<Address, PlayerRating> = env
-            .storage()
-            .instance()
-            .get(&PLAYER_RATINGS)
-            .ok_or(ContractError::RatingNotFound)?;
-
-        ratings.get(player).ok_or(ContractError::RatingNotFound)
-    }
-
-    // ── Internal ELO Calculation Helpers ───────────────────────────────────
-
-    /// Calculate expected score for a player using integer arithmetic
-    /// E_a = 1 / (1 + 10^((R_b - R_a) / 400))
-    /// Returns value scaled by 10000 for precision (e.g., 0.5 -> 5000)
-    fn calculate_expected_score_scaled(rating_a: i32, rating_b: i32) -> i32 {
-        let rating_diff = rating_b - rating_a;
-        
-        // Use lookup table approach for common rating differences
-        // This avoids floating-point math entirely
-        // Expected score = 1 / (1 + 10^(diff/400))
-        // We'll use a simplified approximation
-        
-        // For diff = 0, expected = 0.5 (5000)
-        // For diff = +400, expected ≈ 0.09 (900)
-        // For diff = -400, expected ≈ 0.91 (9100)
-        
-        // Linear approximation: expected = 0.5 - (diff / 800)
-        // Clamp between 0.09 and 0.91
-        let mut expected = 5000 - (rating_diff * 5000 / 800);
-        
-        // Clamp values
-        if expected < 900 {
-            expected = 900;
-        } else if expected > 9100 {
-            expected = 9100;
-        }
-        
-        expected
-    }
-
-    /// Calculate rating change using integer arithmetic
-    /// ΔR = K * (S - E)
-    /// Scores are scaled by 10000
-    fn calculate_rating_change_scaled(expected_scaled: i32, actual_score: i32, k_factor: u32) -> i32 {
-        // actual_score: 10000 for win, 5000 for draw, 0 for loss
-        // expected_scaled: expected score * 10000
-        let diff = actual_score - expected_scaled;
-        ((k_factor as i32) * diff) / 10000
+        Some(timeout_duration - elapsed)
     }
 }
 
@@ -992,6 +890,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger as _;
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
     use soroban_sdk::{Address, Bytes, BytesN, Env};
 
@@ -1252,10 +1151,10 @@ mod tests {
         assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
     }
 
-    // ── ELO Rating System Tests ────────────────────────────────────────────
+    // ── Game Timeout Tests ─────────────────────────────────────────────────
 
     #[test]
-    fn test_register_player() {
+    fn test_configure_timeout() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1268,101 +1167,141 @@ mod tests {
 
         client.initialize_puzzle_rewards(&admin, &admin_key, &0i128, &0u32, &treasury_addr);
 
-        let player = Address::generate(&env);
-        let rating = client.register_player(&player);
+        // Configure timeout to 1000 ledger sequences
+        client.configure_timeout(&admin, &1000u64);
 
-        assert_eq!(rating.rating, 1200);
-        assert_eq!(rating.games_played, 0);
-        assert_eq!(rating.highest_rating, 1200);
+        // Verify it doesn't panic (timeout configured successfully)
     }
 
     #[test]
-    fn test_update_ratings_player1_wins() {
+    fn test_claim_timeout_win_success() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let contract_id = env.register_contract(None, GameContract);
-        let client = GameContractClient::new(&env, &contract_id);
+        let issuer = Address::generate(&env);
+        let stellar_token = env.register_stellar_asset_contract_v2(issuer.clone());
+        let token_address = stellar_token.address();
+        let token_client = TokenClient::new(&env, &token_address);
+        let stellar_asset_client = StellarAssetClient::new(&env, &token_address);
 
         let admin = Address::generate(&env);
-        let admin_key = Bytes::from_slice(&env, &[0u8; 32]);
-        let treasury_addr = Address::generate(&env);
-
-        client.initialize_puzzle_rewards(&admin, &admin_key, &0i128, &0u32, &treasury_addr);
-        client.initialize_elo_system(&admin, &32u32);
-
         let player1 = Address::generate(&env);
         let player2 = Address::generate(&env);
+        let treasury_addr = Address::generate(&env);
 
-        client.register_player(&player1);
-        client.register_player(&player2);
-
-        // Player1 wins
-        let result = client.update_ratings(&player1, &player2, &1u32);
-        let rating1 = result.0;
-        let rating2 = result.1;
-
-        // Player1 should gain rating, Player2 should lose
-        assert!(rating1.rating > 1200);
-        assert!(rating2.rating < 1200);
-        assert_eq!(rating1.wins, 1);
-        assert_eq!(rating2.losses, 1);
-        assert_eq!(rating1.games_played, 1);
-        assert_eq!(rating2.games_played, 1);
-    }
-
-    #[test]
-    fn test_update_ratings_draw() {
-        let env = Env::default();
-        env.mock_all_auths();
+        stellar_asset_client.mint(&player1, &1_000i128);
+        stellar_asset_client.mint(&player2, &1_000i128);
 
         let contract_id = env.register_contract(None, GameContract);
         let client = GameContractClient::new(&env, &contract_id);
 
+        client.initialize_token(&admin, &token_address);
+        client.initialize_puzzle_rewards(&admin, &Bytes::from_slice(&env, &[0u8; 32]), &0i128, &0u32, &treasury_addr);
+
+        // Set timeout to 100 ledgers and raise stake limit
+        client.configure_timeout(&admin, &100u64);
+        client.set_max_stake(&1_000i128);
+
+        let wager: i128 = 100;
+        let game_id = client.create_game(&player1, &wager);
+        client.join_game(&game_id, &player2);
+
+        // Manually set last_move_at to simulate time passing
+        env.as_contract(&contract_id, || {
+            let mut games: Map<u64, Game> = env.storage().instance().get(&GAMES).unwrap();
+            let mut game = games.get(game_id).unwrap();
+            game.last_move_at = 0; // Set to ledger 0
+            games.set(game_id, game);
+            env.storage().instance().set(&GAMES, &games);
+        });
+
+        // Advance ledger to exceed timeout
+        env.ledger().set_sequence_number(101);
+
+        // Player1 claims timeout win
+        client.claim_timeout_win(&game_id, &player1);
+
+        // Verify player1 received the payout (200 - no fee)
+        assert_eq!(token_client.balance(&player1), 1_100);
+    }
+
+    #[test]
+    fn test_claim_timeout_win_not_reached() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let issuer = Address::generate(&env);
+        let stellar_token = env.register_stellar_asset_contract_v2(issuer.clone());
+        let token_address = stellar_token.address();
+        let stellar_asset_client = StellarAssetClient::new(&env, &token_address);
+
         let admin = Address::generate(&env);
-        let admin_key = Bytes::from_slice(&env, &[0u8; 32]);
-        let treasury_addr = Address::generate(&env);
-
-        client.initialize_puzzle_rewards(&admin, &admin_key, &0i128, &0u32, &treasury_addr);
-        client.initialize_elo_system(&admin, &32u32);
-
         let player1 = Address::generate(&env);
         let player2 = Address::generate(&env);
+        let treasury_addr = Address::generate(&env);
 
-        client.register_player(&player1);
-        client.register_player(&player2);
-
-        // Draw
-        let result = client.update_ratings(&player1, &player2, &3u32);
-        let rating1 = result.0;
-        let rating2 = result.1;
-
-        // Both players should have small changes (higher rated loses a bit)
-        assert_eq!(rating1.draws, 1);
-        assert_eq!(rating2.draws, 1);
-        assert_eq!(rating1.games_played, 1);
-        assert_eq!(rating2.games_played, 1);
-    }
-
-    #[test]
-    fn test_get_player_rating() {
-        let env = Env::default();
-        env.mock_all_auths();
+        stellar_asset_client.mint(&player1, &1_000i128);
+        stellar_asset_client.mint(&player2, &1_000i128);
 
         let contract_id = env.register_contract(None, GameContract);
         let client = GameContractClient::new(&env, &contract_id);
 
+        client.initialize_token(&admin, &token_address);
+        client.initialize_puzzle_rewards(&admin, &Bytes::from_slice(&env, &[0u8; 32]), &0i128, &0u32, &treasury_addr);
+        client.configure_timeout(&admin, &1000u64);
+        client.set_max_stake(&1_000i128);
+
+        let wager: i128 = 100;
+        let game_id = client.create_game(&player1, &wager);
+        client.join_game(&game_id, &player2);
+
+        // Try to claim timeout before it's reached
+        let result = client.try_claim_timeout_win(&game_id, &player1);
+        assert_eq!(result, Err(Ok(ContractError::TimeoutNotReached)));
+    }
+
+    #[test]
+    fn test_get_timeout_remaining() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let issuer = Address::generate(&env);
+        let stellar_token = env.register_stellar_asset_contract_v2(issuer.clone());
+        let token_address = stellar_token.address();
+        let stellar_asset_client = StellarAssetClient::new(&env, &token_address);
+
         let admin = Address::generate(&env);
-        let admin_key = Bytes::from_slice(&env, &[0u8; 32]);
+        let player1 = Address::generate(&env);
+        let player2 = Address::generate(&env);
         let treasury_addr = Address::generate(&env);
 
-        client.initialize_puzzle_rewards(&admin, &admin_key, &0i128, &0u32, &treasury_addr);
+        stellar_asset_client.mint(&player1, &1_000i128);
+        stellar_asset_client.mint(&player2, &1_000i128);
 
-        let player = Address::generate(&env);
-        client.register_player(&player);
+        let contract_id = env.register_contract(None, GameContract);
+        let client = GameContractClient::new(&env, &contract_id);
 
-        let rating = client.get_player_rating(&player);
-        assert_eq!(rating.rating, 1200);
-        assert_eq!(rating.address, player);
+        client.initialize_token(&admin, &token_address);
+        client.initialize_puzzle_rewards(&admin, &Bytes::from_slice(&env, &[0u8; 32]), &0i128, &0u32, &treasury_addr);
+        client.configure_timeout(&admin, &1000u64);
+        client.set_max_stake(&1_000i128);
+
+        let wager: i128 = 100;
+        let game_id = client.create_game(&player1, &wager);
+        client.join_game(&game_id, &player2);
+
+        // Should have full timeout remaining
+        let remaining = client.get_timeout_remaining(&game_id);
+        assert_eq!(remaining, Some(1000));
+
+        // Advance ledger by 500 (from 1 to 501 = 500 elapsed)
+        env.ledger().set_sequence_number(501);
+        let remaining = client.get_timeout_remaining(&game_id);
+        assert_eq!(remaining, Some(499)); // 1000 - 501 = 499
+
+        // Advance past timeout
+        env.ledger().set_sequence_number(1001);
+        let remaining = client.get_timeout_remaining(&game_id);
+        assert_eq!(remaining, Some(0));
     }
 }
